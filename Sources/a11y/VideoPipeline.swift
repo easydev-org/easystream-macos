@@ -51,7 +51,7 @@ final class VideoPipeline {
             return
         }
         FileHandle.standardError.write("est: ScreenInput started \(input.width)x\(input.height)\n".data(using: .utf8)!)
-        guard let enc = VTEncoder(width: input.width, height: input.height, fps: 30, bitrate: 12_000_000) else {
+        guard let enc = VTEncoder(width: input.width, height: input.height, fps: 30, bitrate: 25_000_000) else {
             FileHandle.standardError.write("est: VTEncoder init failed\n".data(using: .utf8)!)
             return
         }
@@ -74,7 +74,7 @@ final class VideoPipeline {
         // cap just prevents a runaway when VideoToolbox returns several AUs.
         // NOTE: a change must NEVER be dropped — dropping it delays the visible
         // update to the NEXT change (that was the "typing lags" symptom).
-        let minInterval = 1.0 / 60.0
+        let minInterval = 1.0 / Double(max(1, enc.frameRate))
         var lastEmit = Date.distantPast
         while true {
             let start = Date()

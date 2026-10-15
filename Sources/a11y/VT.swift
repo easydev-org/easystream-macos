@@ -66,7 +66,15 @@ final class VTEncoder {
         // Emit each frame as soon as it is encoded (no lookahead buffering):
         // this is what keeps the glass-to-glass latency low.
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFNumber)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        // Do NOT prioritise speed over quality: with it set, VideoToolbox picks
+        // fast (coarse) tools and the picture visibly degrades. RealTime + the
+        // frame-delay cap already keep the latency low, and the hardware encoder
+        // is fast enough at 1080p.
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanFalse)
+        // A quality floor so low-motion content does not collapse to a few
+        // kbit/s per frame (the encoder is free to spend MORE than the average
+        // bitrate, up to this ceiling).
+        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_Quality, value: 0.75 as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel,
