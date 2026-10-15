@@ -1,8 +1,7 @@
 # The web UI is NOT vendored here: it lives in the single shared repo
 # easydev-org/easystream-webui and is fetched at BUILD time (build-webui.sh).
 # Assets.swift is GENERATED from it (Swift has no include_str! equivalent, and
-# the daemon must be a single boot-fetchable executable, so the UI is inlined
-# as string literals).
-Sources/a11y/Resources/webui/
-Sources/a11y/Assets.swift
+# the daemon must be a single boot-fetchable executable, so the UI is inlined).
+src/Resources/webui/
+src/Assets.swift
 .build/

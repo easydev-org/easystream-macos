@@ -11,8 +11,8 @@ cd "$(dirname "$0")"
 REF="${WEBUI_REF:-main}"
 PROXY="${HTTPS_PROXY:-${HTTP_PROXY:-}}"
 URL="https://codeload.github.com/easydev-org/easystream-webui/tar.gz/refs/heads/${REF}"
-DEST="Sources/a11y/Resources/webui"
-OUT="Sources/a11y/Assets.swift"
+DEST="src/Resources/webui"
+OUT="src/Assets.swift"
 
 tmp="$(mktemp -d)"; trap 'rm -rf "${tmp}"' EXIT
 curl -fsSL ${PROXY:+-x "${PROXY}"} -o "${tmp}/webui.tgz" "${URL}"
