@@ -252,6 +252,30 @@ final class HTTPConn {
                 return (200, try CLI.findText(sel: q["sel"] ?? "*", app: q["app"] ?? "", pid: q["pid"].flatMap { Int32($0) }, output: q["o"] ?? "pretty"))
             case "/a11y/action":
                 return (200, try CLI.actionText(action: q["action"] ?? "press", sel: q["sel"] ?? "*", value: q["value"], app: q["app"] ?? "", pid: q["pid"].flatMap { Int32($0) }))
+            // ── input (the same verbs the Linux/Windows daemons expose) ──
+            case "/a11y/click":
+                Input.click(x: Int32(q["x"] ?? "") ?? 0, y: Int32(q["y"] ?? "") ?? 0,
+                            button: q["button"] ?? "left", count: Int(q["count"] ?? "") ?? 1)
+                return (200, "ok")
+            case "/a11y/type":
+                Input.typeText(q["text"] ?? "")
+                return (200, "ok")
+            case "/a11y/key":
+                let held = (q["held"] ?? "").split(separator: ",").map(String.init)
+                Input.key(q["name"] ?? "", held: held)
+                return (200, "ok")
+            case "/a11y/scroll":
+                Input.scroll(x: Int32(q["x"] ?? "") ?? 0, y: Int32(q["y"] ?? "") ?? 0,
+                             dx: Int32(q["dx"] ?? "") ?? 0, dy: Int32(q["dy"] ?? "") ?? 0)
+                return (200, "ok")
+            case "/a11y/drag":
+                Input.drag(from: (Int32(q["x1"] ?? "") ?? 0, Int32(q["y1"] ?? "") ?? 0),
+                           to: (Int32(q["x2"] ?? "") ?? 0, Int32(q["y2"] ?? "") ?? 0),
+                           durationMs: Int(q["ms"] ?? "") ?? 200)
+                return (200, "ok")
+            case "/a11y/clipboard":
+                if let set = q["set"] { try Clipboard.set(set); return (200, "ok") }
+                return (200, try Clipboard.get())
             default:
                 return (404, "unknown a11y path")
             }

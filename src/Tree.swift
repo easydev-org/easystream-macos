@@ -26,7 +26,13 @@ enum Tree {
     /// and the continuation prefix (`│   `/`    `) is threaded down.
     static func dump(_ node: AXNode, depth: Int, prefix: String, lines: inout [String]) {
         // Caller passes the connector for THIS node ("" for the root).
-        let label = Role.name(node.role) + (node.displayName.isEmpty ? "" : " \"\(node.displayName)\"")
+        // Print the NAME and, when present, the VALUE. A text area's content
+        // lives in AXValue (its title is empty), so without this a TextEdit
+        // document is invisible in the tree — the "cannot read the text" bug.
+        var label = Role.name(node.role)
+        if !node.displayName.isEmpty { label += " \"\(node.displayName)\"" }
+        let v = node.value
+        if !v.isEmpty && v != node.displayName { label += " = \"\(v)\"" }
         lines.append(prefix + label)
         guard depth > 0 else { return }
         let kids = node.children()
