@@ -69,7 +69,12 @@ final class VideoPipeline {
         // without this the daemon emitted ~143 AU/s instead of the 30 fps the
         // Hello advertises (needless CPU/bandwidth, and the browser decoded
         // far more frames than the display could show).
-        let frameInterval = 1.0 / Double(max(1, enc.frameRate))
+        // Safety cap only: never emit faster than this. The capture is
+        // change-driven, so the natural rate already matches the display; the
+        // cap just prevents a runaway when VideoToolbox returns several AUs.
+        // NOTE: a change must NEVER be dropped — dropping it delays the visible
+        // update to the NEXT change (that was the "typing lags" symptom).
+        let minInterval = 1.0 / 60.0
         var lastEmit = Date.distantPast
         while true {
             let start = Date()
@@ -84,33 +89,34 @@ final class VideoPipeline {
             }
             if let pb = input.next(timeoutMs: 8) {
                 skipped = 0
-                if Date().timeIntervalSince(lastEmit) >= frameInterval {
-                    lastEmit = Date()
-                    // Concatenate all access units of ONE encode call into a
-                    // single est frame: VideoToolbox returns the SLICES of one
-                    // coded picture as several AUs, and sending them as
-                    // separate frames makes the browser decode each slice as
-                    // its own picture (the missing rows show up as green/white
-                    // bands). They are Annex-B, so concatenation is one AU.
-                    let aus = enc.encodePixelBuffer(pb)
-                    if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
-                }
+                // Emit EVERY change; only pace it to the 60fps cap.
+                let since = Date().timeIntervalSince(lastEmit)
+                if since < minInterval { usleep(useconds_t((minInterval - since) * 1_000_000)) }
+                lastEmit = Date()
+                // Concatenate all access units of ONE encode call into a
+                // single est frame: VideoToolbox returns the SLICES of one
+                // coded picture as several AUs, and sending them as separate
+                // frames makes the browser decode each slice as its own picture
+                // (the missing rows show up as green/white bands). They are
+                // Annex-B, so concatenation is one AU.
+                let aus = enc.encodePixelBuffer(pb)
+                if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
             } else if warmup > 0 || skipped >= 15 {
                 if warmup > 0 { warmup -= 1 }
                 skipped = 0
-                if Date().timeIntervalSince(lastEmit) >= frameInterval {
-                    lastEmit = Date()
-                    if let (_, _, bgra) = Self.grabBGRA() {
-                        let aus = enc.encode(bgra)
-                        if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
-                    }
+                let since = Date().timeIntervalSince(lastEmit)
+                if since < minInterval { usleep(useconds_t((minInterval - since) * 1_000_000)) }
+                lastEmit = Date()
+                if let (_, _, bgra) = Self.grabBGRA() {
+                    let aus = enc.encode(bgra)
+                    if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
                 }
             } else {
                 skipped += 1
             }
             // Single pacing sleep: only the leftover of the frame interval.
             let spent = Date().timeIntervalSince(start)
-            let rest = frameInterval - spent
+            let rest = minInterval - spent
             if rest > 0 { usleep(useconds_t(rest * 1_000_000)) }
         }
     }
