@@ -154,6 +154,23 @@ enum Capture {
         return try captureCGWindowList(region: nil)
     }
 
+    /// screenshotPNG captures the screen and encodes it as PNG bytes (for the
+    /// /a11y/screenshot HTTP endpoint — the daemon process itself has the
+    /// Screen Recording grant, unlike a spawned CLI child).
+    static func screenshotPNG() throws -> Data {
+        let cg = try screenshotCGSync()
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData, UTType.png.identifier as CFString, 1, nil) else {
+            throw A11yError("CGImageDestinationCreateWithData failed")
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else {
+            throw A11yError("CGImageDestinationFinalize failed")
+        }
+        return data as Data
+    }
+
     // Reused capture buffers/context: allocating an 8 MB array + a CGContext per
     // frame is a large part of the per-frame cost on the CGWindowList path.
     private static var buf: [UInt8] = []

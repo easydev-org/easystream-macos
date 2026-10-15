@@ -65,6 +65,9 @@ enum Serve {
             writeFrame(tHello, Data(hello))
             // One shared video pipeline for the whole daemon (started once).
             Conn.startVideoOnce()
+            // This new viewer needs an IDR to start decoding: ask the pump for
+            // one (VideoToolbox never emits a keyframe unprompted).
+            VideoPipeline.shared.requestKeyframe()
             readLoop(Data())
         }
 

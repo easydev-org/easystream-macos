@@ -14,10 +14,26 @@ final class VTEncoder {
     private let width: Int
     private let height: Int
     private let fps: Int
+    /// fps is the encoder's configured frame rate (also the pump's emit cap).
+    var frameRate: Int { fps }
     private var session: VTCompressionSession?
     private var frameIndex: Int64 = 0
+    /// Emit an IDR on the first frame and periodically after, so a decoder that
+    /// joins mid-stream (and the very first viewer) always gets a keyframe.
+    /// VideoToolbox does NOT emit one on its own when frameProperties is nil —
+    /// the stream was all P-frames, which no decoder can start from.
+    private var sinceKey: Int = 1_000_000
+    // 0 => EVERY frame is an IDR. VideoToolbox's P-frames decode fine in ffmpeg
+    // but Chrome's WebCodecs decoder rejects them ("Decoding error"), so the
+    // screen stream is all-keyframe: robust and, for screen content, cheap.
+    private let keyEvery = 0
     /// out collects the AUs produced by the callback during one Encode call.
     private var out: [Data] = []
+    /// The SPS/PPS captured from the FIRST sample's format description. Reused
+    /// for every later IDR: VideoToolbox may hand back a slightly different
+    /// format description per sample, and re-emitting changing parameter sets
+    /// mid-stream makes a decoder reject the frame.
+    private var cachedParams: [Data]?
 
     init?(width: Int, height: Int, fps: Int, bitrate: Int) {
         self.width = width
@@ -54,7 +70,7 @@ final class VTEncoder {
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: kVTProfileLevel_H264_High_AutoLevel)
+                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
         // Emit SPS/PPS inline with each IDR so a mid-stream join works.
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowTemporalCompression, value: kCFBooleanTrue)
         // Ask for hardware when available (falls back to software silently).
@@ -83,10 +99,15 @@ final class VTEncoder {
         let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
         let pts = CMTime(value: frameIndex, timescale: CMTimeScale(fps))
         frameIndex += 1
+        let forceKey = sinceKey >= keyEvery
+        let frameProps: CFDictionary? = forceKey
+            ? ([kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary)
+            : nil
         let st = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pb, presentationTimeStamp: pts, duration: dur,
-            frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flagsOut)
+            frameProperties: frameProps, sourceFrameRefcon: nil, infoFlagsOut: &flagsOut)
         if st != noErr { return [] }
+        sinceKey = forceKey ? 0 : sinceKey + 1
         // Drain synchronously so the callback has run before we return.
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: pts)
         return out
@@ -99,6 +120,10 @@ final class VTEncoder {
         }
         session = nil
     }
+
+    /// forceKeyframe makes the NEXT encoded frame an IDR (SPS+PPS+IDR). Called
+    /// when a new viewer subscribes so it can start decoding immediately.
+    func forceKeyframe() { sinceKey = keyEvery }
 
     // ── internals ─────────────────────────────────────────────────────────
 
@@ -142,16 +167,23 @@ final class VTEncoder {
             parameterSetSizeOut: nil, parameterSetCountOut: &paramCount,
             nalUnitHeaderLengthOut: &nalLenSize)
         let nalLen = Int(nalLenSize)
-        var params: [Data] = []
-        for i in 0..<max(0, paramCount) {
-            var ptr: UnsafePointer<UInt8>?
-            var size = 0
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                fmt, parameterSetIndex: i, parameterSetPointerOut: &ptr,
-                parameterSetSizeOut: &size, parameterSetCountOut: nil,
-                nalUnitHeaderLengthOut: nil) == noErr, let p = ptr, size > 0 {
-                params.append(Data(bytes: p, count: size))
+        let params: [Data]
+        if let cached = cachedParams {
+            params = cached
+        } else {
+            var ps: [Data] = []
+            for i in 0..<max(0, paramCount) {
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    fmt, parameterSetIndex: i, parameterSetPointerOut: &ptr,
+                    parameterSetSizeOut: &size, parameterSetCountOut: nil,
+                    nalUnitHeaderLengthOut: nil) == noErr, let p = ptr, size > 0 {
+                    ps.append(Data(bytes: p, count: size))
+                }
             }
+            if !ps.isEmpty { cachedParams = ps }
+            params = ps
         }
         guard let bb = CMSampleBufferGetDataBuffer(sample) else { return nil }
         var total = 0
@@ -164,6 +196,7 @@ final class VTEncoder {
         // VCL slice: an AU is the leading parameter NALs + ONE VCL slice.
         var aus: [Data] = []
         var cur = Data()
+        var curHasVCL = false
         var off = 0
         let startCode: [UInt8] = [0, 0, 0, 1]
         while off + nalLen <= total {
@@ -173,7 +206,10 @@ final class VTEncoder {
             if len <= 0 || off + len > total { break }
             let nalType = UInt8(bitPattern: p[off]) & 0x1f
             let isVCL = (nalType == 1 || nalType == 5)
-            if isVCL && !cur.isEmpty { aus.append(cur); cur = Data() }
+            if isVCL && !cur.isEmpty {
+                if curHasVCL { aus.append(cur) }
+                cur = Data(); curHasVCL = false
+            }
             // Prepend SPS/PPS before each IDR (type 5) so mid-stream joins work.
             if nalType == 5 {
                 for ps in params {
@@ -183,10 +219,12 @@ final class VTEncoder {
             }
             cur.append(contentsOf: startCode)
             cur.append(UnsafeBufferPointer(start: UnsafeRawPointer(p + off).assumingMemoryBound(to: UInt8.self), count: len))
-            if isVCL { aus.append(cur); cur = Data() }
+            if isVCL { curHasVCL = true; aus.append(cur); cur = Data(); curHasVCL = false }
             off += len
         }
-        if !cur.isEmpty { aus.append(cur) }
+        // A trailing AU with no VCL NAL (e.g. a lone SEI) carries no picture and
+        // makes WebCodecs reject the chunk ("Decoding error") — drop it.
+        if !cur.isEmpty && curHasVCL { aus.append(cur) }
         return aus.isEmpty ? nil : aus
     }
 }

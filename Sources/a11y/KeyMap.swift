@@ -33,9 +33,19 @@ enum KeyMap {
         "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
         "shift": 0x38, "ctrl": 0x3B, "control": 0x3B, "alt": 0x3A, "option": 0x3A,
         "cmd": 0x37, "command": 0x37, "meta": 0x37, "super": 0x37,
+        // X11/Linux-style modifier aliases (est clients send these names). The
+        // lookup strips '_' and spaces, so these keys must have NO underscore
+        // ("Meta_L" normalises to "metal").
+        "metal": 0x37, "superl": 0x37, "commandl": 0x37,
+        "shiftl": 0x38, "shiftr": 0x3C,
+        "controll": 0x3B, "ctrll": 0x3B, "controlr": 0x3E,
+        "altl": 0x3A, "optionl": 0x3A, "altr": 0x3D,
         "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61,
         "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
     ]
+
+    /// charKey is the public entry point for character -> keycode lookups.
+    static func charKey(_ c: Character) -> (CGKeyCode, Bool)? { char(c) }
 
     private static func char(_ c: Character) -> (CGKeyCode, Bool)? {
         if let k = charMap[c] { return (k, false) }

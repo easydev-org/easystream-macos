@@ -11,6 +11,10 @@ import CoreVideo
 final class VideoPipeline {
     static let shared = VideoPipeline()
     private var started = false
+    /// Set when a NEW viewer subscribes: the pump then forces an IDR so that
+    /// viewer can start decoding immediately (VideoToolbox emits none on its
+    /// own, and the periodic key is ~2 s away on a slow/static screen).
+    private var wantKey = true
     private let lock = NSLock()
 
     private init() {}
@@ -19,10 +23,22 @@ final class VideoPipeline {
     /// `sink`. Safe to call from every connection; only the first one starts it.
     func run(sink: @escaping (Data) -> Void) {
         lock.lock()
+        wantKey = true
         if started { lock.unlock(); return }
         started = true
         lock.unlock()
         Thread.detachNewThread { [weak self] in self?.loop(sink: sink) }
+    }
+
+    /// requestKeyframe asks the pump to emit an IDR on its next frame.
+    func requestKeyframe() {
+        lock.lock(); wantKey = true; lock.unlock()
+    }
+
+    /// takeKeyRequest consumes the pending keyframe request.
+    private func takeKeyRequest() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let k = wantKey; wantKey = false; return k
     }
 
     private func loop(sink: (Data) -> Void) {
@@ -43,22 +59,58 @@ final class VideoPipeline {
         // VideoToolbox needs a few warm-up frames and AVCaptureScreenInput is
         // change-driven, so force-feed the first frames + a periodic keepalive.
         var warmup = 8
+        // Time-based keyframes: a static screen emits very few frames, so a
+        // frame-count keyframe interval can leave a fresh viewer without an IDR
+        // for many seconds (the decoder then never starts).
+        var lastKey = Date.distantPast
+        // Hard frame-rate cap. VideoToolbox can return SEVERAL access units from
+        // one Encode call (it batches when fed faster than it drains), and the
+        // capture delegate can deliver above the requested minFrameDuration, so
+        // without this the daemon emitted ~143 AU/s instead of the 30 fps the
+        // Hello advertises (needless CPU/bandwidth, and the browser decoded
+        // far more frames than the display could show).
+        let frameInterval = 1.0 / Double(max(1, enc.frameRate))
+        var lastEmit = Date.distantPast
         while true {
             let start = Date()
-            if let pb = input.next(timeoutMs: 30) {
+            // Do NOT pre-sleep before capturing: the pump used to wait out the
+            // frame interval BEFORE looking for a change AND sleep again at the
+            // tail, so a change took up to ~2 intervals (~66ms) to reach the
+            // viewer — that is what made input feel laggy. Wait for a change
+            // first (short timeout), and only pace the EMIT below.
+            if takeKeyRequest() || Date().timeIntervalSince(lastKey) > 1.0 {
+                enc.forceKeyframe()
+                lastKey = Date()
+            }
+            if let pb = input.next(timeoutMs: 8) {
                 skipped = 0
-                for au in enc.encodePixelBuffer(pb) { sink(au) }
+                if Date().timeIntervalSince(lastEmit) >= frameInterval {
+                    lastEmit = Date()
+                    // Concatenate all access units of ONE encode call into a
+                    // single est frame: VideoToolbox returns the SLICES of one
+                    // coded picture as several AUs, and sending them as
+                    // separate frames makes the browser decode each slice as
+                    // its own picture (the missing rows show up as green/white
+                    // bands). They are Annex-B, so concatenation is one AU.
+                    let aus = enc.encodePixelBuffer(pb)
+                    if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
+                }
             } else if warmup > 0 || skipped >= 15 {
                 if warmup > 0 { warmup -= 1 }
                 skipped = 0
-                if let (_, _, bgra) = Self.grabBGRA() {
-                    for au in enc.encode(bgra) { sink(au) }
+                if Date().timeIntervalSince(lastEmit) >= frameInterval {
+                    lastEmit = Date()
+                    if let (_, _, bgra) = Self.grabBGRA() {
+                        let aus = enc.encode(bgra)
+                        if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
+                    }
                 }
             } else {
                 skipped += 1
             }
+            // Single pacing sleep: only the leftover of the frame interval.
             let spent = Date().timeIntervalSince(start)
-            let rest = 0.033 - spent
+            let rest = frameInterval - spent
             if rest > 0 { usleep(useconds_t(rest * 1_000_000)) }
         }
     }

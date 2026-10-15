@@ -9,7 +9,10 @@ const cv = $('screen');
 const ctx = cv.getContext('2d');
 const kbd = $('kbd');
 const bar = $('bar');
-const S = { ws: null, dec: null, codec: 'avc1.42E01F', w: 0, h: 0, gotKey: false,
+// avc1.42E033 = H.264 Baseline, Level 5.1 — the level must cover 1080p (the
+// macOS encoder emits Level 4.0 = 0x28; a Level-3.1 string made the browser
+// reject 1920x1080 with EncodingError). Level 5.1 is a safe superset.
+const S = { ws: null, dec: null, codec: 'avc1.42E033', w: 0, h: 0, gotKey: false,
   frames: 0, fps: 0, t0: performance.now(), userScale: 1, panX: 0, panY: 0 };
 
 // offscreen holds the latest frame at native size so zoom/pan repaint instantly.
@@ -26,9 +29,31 @@ function frame(type, body) {
   return out;
 }
 function send(bytes) { if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send(bytes); }
-function sendMove(x, y) { const b = new Uint8Array(4); const d = new DataView(b.buffer);
-  d.setUint16(0, x, false); d.setUint16(2, y, false); send(frame(T.MOVE, b)); }
-function sendButton(btn, down) { send(frame(T.BUTTON, new Uint8Array([btn, down ? 1 : 0]))); }
+// Coalesce pointer moves to ONE per animation frame. Without this, every
+// pointermove during a press floods the guest with MOVE events, so a plain
+// click becomes "down + many drags + up" — which macOS treats as a long press.
+let _pendingMove = null, _moveRaf = 0;
+function flushMove() {
+  if (_moveRaf) { cancelAnimationFrame(_moveRaf); _moveRaf = 0; }
+  const m = _pendingMove; _pendingMove = null;
+  if (!m) return;
+  const b = new Uint8Array(4); const d = new DataView(b.buffer);
+  d.setUint16(0, m[0], false); d.setUint16(2, m[1], false); send(frame(T.MOVE, b));
+}
+function sendMove(x, y) {
+  _pendingMove = [x, y];
+  if (_moveRaf) return;
+  _moveRaf = requestAnimationFrame(() => {
+    _moveRaf = 0;
+    const m = _pendingMove; _pendingMove = null;
+    if (!m) return;
+    const b = new Uint8Array(4); const d = new DataView(b.buffer);
+    d.setUint16(0, m[0], false); d.setUint16(2, m[1], false); send(frame(T.MOVE, b));
+  });
+}
+// The button event must follow the pointer position it applies to, so flush any
+// queued MOVE first (otherwise a click lands at the previous location).
+function sendButton(btn, down) { flushMove(); send(frame(T.BUTTON, new Uint8Array([btn, down ? 1 : 0]))); }
 // Key: nameLen, name, u32 char, u8 down (matches the daemons; EST.md omits char)
 function sendKey(name, ch, down) {
   const nb = new TextEncoder().encode(name || '');
@@ -53,7 +78,7 @@ function onBytes(chunk) {
     const body = rx.slice(6, 6 + len);
     rx = rx.slice(6 + len);
     if (type === T.HELLO) {
-      if (body[1] === 1) S.codec = 'avc1.42E01F';
+      if (body[1] === 1) S.codec = 'avc1.42E033';
       S.w = (body[2] << 8) | body[3]; S.h = (body[4] << 8) | body[5];
       off.width = S.w || 1; off.height = S.h || 1;
       startDecoder(); resize();
@@ -103,8 +128,12 @@ function decodeVideo(b) {
   const key = hasIDR(b);
   if (!key && !S.gotKey) return;
   if (key) S.gotKey = true;
+  // A STRICTLY increasing timestamp is required: frames can arrive several per
+  // millisecond, so performance.now()*1000 is not guaranteed monotonic and
+  // WebCodecs then rejects the chunk with "Decoding error".
+  S.ts = (S.ts || 0) + 1000;
   try { S.dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta',
-    timestamp: performance.now() * 1000, data: b })); } catch {}
+    timestamp: S.ts, data: b })); } catch {}
 }
 
 // ── view: fit × userScale + pan, letterboxed ────────────────────────────────

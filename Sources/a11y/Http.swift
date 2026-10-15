@@ -79,6 +79,15 @@ final class HTTPConn {
         case "/", "/index.html": body = Assets.index
         case "/app.js": body = Assets.js
         case "/health": body = "ok"
+        case "/a11y/screenshot":
+            // The daemon process itself holds the Screen Recording grant, so a
+            // capture from HERE is reliable (a spawned CLI child is not).
+            if let png = try? Capture.screenshotPNG() {
+                respondBinary(status: 200, ctype: "image/png", body: png)
+                return
+            }
+            respond(status: 500, ctype: "text/plain", body: "screenshot failed")
+            return
         default:
             if path.hasPrefix("/a11y/") {
                 let r = a11y(path: path, query: query)
@@ -94,8 +103,13 @@ final class HTTPConn {
 
     private func respond(status: Int, ctype: String, body: String) {
         let bytes = Array(body.utf8)
-        let head = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\nContent-Type: \(ctype)\r\nContent-Length: \(bytes.count)\r\nConnection: close\r\n\r\n"
+        let head = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\nContent-Type: \(ctype)\r\nCache-Control: no-store\r\nContent-Length: \(bytes.count)\r\nConnection: close\r\n\r\n"
         conn.send(content: Data(head.utf8) + Data(bytes), completion: .contentProcessed { _ in self.close() })
+    }
+
+    private func respondBinary(status: Int, ctype: String, body: Data) {
+        let head = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\nContent-Type: \(ctype)\r\nCache-Control: no-store\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        conn.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in self.close() })
     }
 
     private func close() {
