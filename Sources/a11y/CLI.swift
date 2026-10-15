@@ -310,6 +310,10 @@ enum CLI {
             switch output {
             case "bounds": if let b = n.bounds { lines.append("\(b.x),\(b.y),\(b.w),\(b.h)") }
             case "center": if let b = n.bounds { lines.append("\(b.x + Int32(b.w / 2)),\(b.y + Int32(b.h / 2))") }
+            // "value" prints the element's AXValue (its CONTENT). The default
+            // (title) is empty for a text area, so this is the only way to read
+            // e.g. a TextEdit document over the a11y API.
+            case "value": lines.append(n.value)
             default: lines.append("\(Role.name(n.role)) \"\(n.displayName)\"")
             }
         }

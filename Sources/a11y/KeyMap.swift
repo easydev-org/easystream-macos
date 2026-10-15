@@ -28,7 +28,11 @@ enum KeyMap {
 
     private static let named: [String: CGKeyCode] = [
         "return": 0x24, "enter": 0x24, "escape": 0x35, "esc": 0x35, "tab": 0x30,
-        "space": 0x31, "backspace": 0x33, "delete": 0x33,
+        // macOS: Backspace (delete the char BEFORE the cursor) = 0x33;
+        // Delete / ForwardDelete (delete the char AFTER) = 0x75. They used to
+        // share 0x33, so the browser's Delete key deleted backwards.
+        "space": 0x31, "backspace": 0x33,
+        "delete": 0x75, "forwarddelete": 0x75, "del": 0x75,
         "up": 0x7E, "down": 0x7D, "left": 0x7B, "right": 0x7C,
         "home": 0x73, "end": 0x77, "pageup": 0x74, "pagedown": 0x79,
         "shift": 0x38, "ctrl": 0x3B, "control": 0x3B, "alt": 0x3A, "option": 0x3A,

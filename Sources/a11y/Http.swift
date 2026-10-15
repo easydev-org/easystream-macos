@@ -32,12 +32,22 @@ final class HTTPConn {
     private let conn: NWConnection
     private let estPort: UInt16
     private var buf = Data()
+    /// Set once the request has been handed off (e.g. upgraded to the est
+    /// WebSocket). The generic receive loop must then STOP re-arming itself —
+    /// otherwise it competes with wsPipe's own receive on the same connection
+    /// and each loop steals about half of the incoming bytes (which is exactly
+    /// how every other keystroke was lost).
+    private var upgraded = false
+    /// Per-connection serial queue. Running everything on .global() starved the
+    /// receive loop once the video pump started flooding sends (input frames
+    /// then stopped being delivered after ~a dozen reads).
+    private let q = DispatchQueue(label: "http.conn")
 
     init(conn: NWConnection, estPort: UInt16) { self.conn = conn; self.estPort = estPort }
 
     func start() {
         HTTPConn.lock.lock(); HTTPConn.live[ObjectIdentifier(self)] = self; HTTPConn.lock.unlock()
-        conn.start(queue: .global())
+        conn.start(queue: q)
         receive()
     }
 
@@ -47,7 +57,8 @@ final class HTTPConn {
             if let data = data { self.buf.append(data) }
             if err != nil || done { self.close(); return }
             self.maybeHandle()
-            self.receive()
+            // Only continue the generic loop while we still own the socket.
+            if !self.upgraded { self.receive() }
         }
     }
 
@@ -69,6 +80,7 @@ final class HTTPConn {
         let path = url.split(separator: "?", maxSplits: 1).first.map(String.init) ?? "/"
         let query = url.contains("?") ? String(url.split(separator: "?", maxSplits: 1)[1]) : ""
         // Stop the normal receive loop: we own the socket from here.
+        upgraded = true
         buf = Data()
         if path == "/est/ws" {
             wsPipe(headers: headers, leftover: rest)
@@ -138,25 +150,42 @@ final class HTTPConn {
             }
         }
         pumpEst()
-        // browser -> est
-        func pumpWS(_ pending: Data) {
-            var acc = pending
-            func step() {
-                while true {
-                    guard let (payload, consumed, isBinary, closed) = wsParse(acc) else { return }
-                    acc = acc.dropFirst(consumed)
-                    if closed { est.cancel(); close(); return }
-                    if isBinary { est.send(content: payload, completion: .contentProcessed { _ in }) }
+        // browser -> est. ONE shared buffer, appended to as bytes arrive and
+        // drained frame-by-frame. A WebSocket read can deliver several est
+        // frames at once; the previous recursive version could drop/merge the
+        // tail (the browser's input frames then arrived garbled and half of the
+        // keystrokes were lost).
+        let wsBuf = NSLock()
+        var acc = leftover
+        func drain() {
+            while true {
+                guard let (payload, consumed, isBinary, closed) = wsParse(acc) else { return }
+                acc = acc.dropFirst(consumed)
+                if closed { est.cancel(); self.close(); return }
+                if isBinary {
+                    est.send(content: payload, completion: .contentProcessed { err in
+                        if let err = err {
+                        }
+                    })
                 }
             }
-            step()
+        }
+        drain()
+        // A dedicated serial queue drives the receive loop. Re-arming the
+        // receive from INSIDE the completion handler stopped delivering after a
+        // dozen frames (half the keystrokes were lost — the rest stayed unread
+        // in the client's socket buffer). Driving it from our own queue keeps
+        // the loop alive.
+        let wsQ = DispatchQueue(label: "est.ws.read")
+        func pumpWS() {
             conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { data, _, done, err in
-                if let data = data { acc.append(data) }
+                if let data = data, !data.isEmpty { wsBuf.lock(); acc.append(data); wsBuf.unlock() }
+                wsBuf.lock(); drain(); wsBuf.unlock()
                 if err != nil || done { est.cancel(); self.close(); return }
-                pumpWS(acc)
+                wsQ.async { pumpWS() }
             }
         }
-        pumpWS(leftover)
+        wsQ.async { pumpWS() }
     }
 
     private func wsAccept(_ key: String) -> String {
