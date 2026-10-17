@@ -11,6 +11,11 @@ enum Serve {
     // Message types (EST.md).
     private static let tHello: UInt8 = 0x01
     private static let tVideo: UInt8 = 0x02
+    private static let tAuth: UInt8 = 0x03
+    private static let tAuthOk: UInt8 = 0x04
+    private static let tAudio: UInt8 = 0x05
+    private static let tAudioReq: UInt8 = 0x06
+    private static let tAudioOff: UInt8 = 0x07
     private static let tMove: UInt8 = 0x10
     private static let tButton: UInt8 = 0x11
     private static let tScroll: UInt8 = 0x12
@@ -45,6 +50,10 @@ enum Serve {
 
         private let conn: NWConnection
         private let wq = DispatchQueue(label: "est.write")
+        /// Access mode for THIS connection (View = read-only); set by Auth.
+        private var mode: Auth.Mode = Auth.isOpen ? .control : .view
+        /// Whether this connection wants Audio frames (turned on by AudioReq).
+        private var audioOn = false
 
 
 
@@ -57,14 +66,28 @@ enum Serve {
             conn.start(queue: .global())
             // Hello: version, codec(H.264), w, h, fps.
             let (w, h) = screenSize()
-            var hello = [UInt8](repeating: 0, count: 7)
+            var hello = [UInt8](repeating: 0, count: 7 + 8)
             hello[0] = 1; hello[1] = 1
             hello[2] = UInt8(w >> 8); hello[3] = UInt8(w & 0xff)
             hello[4] = UInt8(h >> 8); hello[5] = UInt8(h & 0xff)
             hello[6] = 30
+            // Audio block @7: present, codec(1=Opus), rate(u32), ch, frameMs.
+            let (hasAudio, aRate, aCh, aMs) = AudioPipeline.params()
+            hello[7] = hasAudio ? 1 : 0
+            hello[8] = 1
+            hello[9] = UInt8((aRate >> 24) & 0xff); hello[10] = UInt8((aRate >> 16) & 0xff)
+            hello[11] = UInt8((aRate >> 8) & 0xff); hello[12] = UInt8(aRate & 0xff)
+            hello[13] = aCh; hello[14] = aMs
             writeFrame(tHello, Data(hello))
             // One shared video pipeline for the whole daemon (started once).
             Conn.startVideoOnce()
+            // Audio: subscribe this connection to the shared Opus pipeline.
+            if hasAudio {
+                AudioPipeline.shared.subscribe { [weak self] pkt in
+                    guard let self = self else { return }
+                    if self.audioOn { self.writeFrame(Serve.tAudio, pkt) }
+                }
+            }
             // This new viewer needs an IDR to start decoding: ask the pump for
             // one (VideoToolbox never emits a keyframe unprompted).
             VideoPipeline.shared.requestKeyframe()
@@ -120,6 +143,17 @@ enum Serve {
         private func dispatch(_ typ: UInt8, _ b: Data) {
             let a = [UInt8](b)
             func i16(_ o: Int) -> Int32 { o + 1 < a.count ? Int32(Int16(bitPattern: UInt16(a[o]) << 8 | UInt16(a[o + 1]))) : 0 }
+            if typ == Serve.tAuth {
+                let tok = String(decoding: a, as: UTF8.self)
+                mode = Auth.authorize(tok)
+                writeFrame(Serve.tAuthOk, Data([mode.rawValue]))
+                FileHandle.standardError.write("est: auth -> \(mode)\n".data(using: .utf8)!)
+                return
+            }
+            if typ == Serve.tAudioReq { audioOn = true; return }
+            if typ == Serve.tAudioOff { audioOn = false; return }
+            // View mode: drop every frame that would CHANGE the guest.
+            if mode == .view && Auth.isMutation(typ) { return }
             switch typ {
             case tMove:
                 Input.warp(x: i16(0), y: i16(2))

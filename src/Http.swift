@@ -79,11 +79,19 @@ final class HTTPConn {
         }
         let path = url.split(separator: "?", maxSplits: 1).first.map(String.init) ?? "/"
         let query = url.contains("?") ? String(url.split(separator: "?", maxSplits: 1)[1]) : ""
+        // View is the open default; only the control token upgrades to CONTROL.
+        let token = Auth.tokenFrom(headers: headers, query: query)
+        let mode = Auth.authorize(token)
+        if mode == .view && Auth.a11yIsMutation(path: path, query: query) {
+            upgraded = true; buf = Data()
+            respond(status: 403, ctype: "text/plain", body: "read-only")
+            return
+        }
         // Stop the normal receive loop: we own the socket from here.
         upgraded = true
         buf = Data()
         if path == "/est/ws" {
-            wsPipe(headers: headers, leftover: rest)
+            wsPipe(headers: headers, leftover: rest, mode: mode, wantAudio: query.contains("audio=1"))
             return
         }
         let body: String
@@ -131,15 +139,41 @@ final class HTTPConn {
 
     // ── WebSocket pipe ──────────────────────────────────────────────────────
 
-    private func wsPipe(headers: [String: String], leftover: Data) {
+    private func wsPipe(headers: [String: String], leftover: Data, mode: Auth.Mode, wantAudio: Bool) {
         guard let key = headers["sec-websocket-key"] else { close(); return }
         let accept = wsAccept(key)
-        let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
+        // Browsers REQUIRE the server to echo a subprotocol when the client
+        // offered one, or they fail the connection. Echo "est" (never the token).
+        var proto = "est"
+        if let p = headers["sec-websocket-protocol"] {
+            for part in p.split(separator: ",") {
+                let t = part.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { proto = t; break }
+            }
+        }
+        let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\nSec-WebSocket-Protocol: \(proto)\r\n\r\n"
         // Connect to our own est listener.
         let params = NWParameters.tcp
         let est = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: estPort)!, using: params)
         conn.send(content: Data(resp.utf8), completion: .contentProcessed { _ in })
         est.start(queue: .global())
+        // Propagate the mode to est with an Auth frame (defence in depth), and
+        // ask for audio if the browser wants it.
+        if !Auth.isOpen, let tok = (mode == .control
+            ? ProcessInfo.processInfo.environment["EAZYSTREAM_CONTROL_TOKEN"]
+            : ProcessInfo.processInfo.environment["EAZYSTREAM_VIEW_TOKEN"]) {
+            var hdr = [UInt8](repeating: 0, count: 6)
+            hdr[0] = 0x03
+            let n = UInt32(tok.utf8.count)
+            hdr[2] = UInt8((n >> 24) & 0xff); hdr[3] = UInt8((n >> 16) & 0xff)
+            hdr[4] = UInt8((n >> 8) & 0xff); hdr[5] = UInt8(n & 0xff)
+            est.send(content: Data(hdr) + Data(tok.utf8), completion: .contentProcessed { _ in })
+        }
+        if wantAudio {
+            var hdr = [UInt8](repeating: 0, count: 6)
+            hdr[0] = 0x06
+            est.send(content: Data(hdr), completion: .contentProcessed { _ in })
+        }
         // est -> browser
         func pumpEst() {
             est.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [weak self] data, _, done, err in
@@ -163,6 +197,10 @@ final class HTTPConn {
                 acc = acc.dropFirst(consumed)
                 if closed { est.cancel(); self.close(); return }
                 if isBinary {
+                    // View mode: drop mutation frames before they reach est.
+                    if mode == .view, let first = payload.first, Auth.isMutation(first) {
+                        continue
+                    }
                     est.send(content: payload, completion: .contentProcessed { err in
                         if let err = err {
                         }

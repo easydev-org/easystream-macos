@@ -46,6 +46,11 @@ enum KeyMap {
         "altl": 0x3A, "optionl": 0x3A, "altr": 0x3D,
         "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61,
         "f7": 0x62, "f8": 0x64, "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+        // Lock / system keys (kVK_CapsLock = 0x39, etc.).
+        "capslock": 0x39, "caps": 0x39,
+        "numlock": 0x47, "scrolllock": 0x6F,
+        "printscreen": 0x69, "print": 0x69,
+        "pause": 0x71, "menu": 0x6E, "contextmenu": 0x6E,
     ]
 
     /// charKey is the public entry point for character -> keycode lookups.
