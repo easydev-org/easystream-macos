@@ -65,6 +65,9 @@ enum CLI {
     static func cmdServe(_ a: Args) throws {
         let port = UInt16(a.flag("--port") ?? ProcessInfo.processInfo.environment["EAZYSTREAM_PORT"] ?? "48079") ?? 48079
         let httpPort = UInt16(ProcessInfo.processInfo.environment["EAZYSTREAM_HTTP_PORT"] ?? "48078") ?? 48078
+        // Resolve the audio capability once, so /capabilities reports the real
+        // path (BlackHole / None) instead of "Probing" from the first request.
+        AudioPipeline.ensureProbed()
         // The HTTP surface (webui + /est/ws pipe + /a11y) runs alongside the est
         // listener in the SAME process, so the daemon is the only thing a viewer
         // or the worker connects to.

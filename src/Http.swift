@@ -99,6 +99,7 @@ final class HTTPConn {
         case "/", "/index.html": body = Assets.index
         case "/app.js": body = Assets.js
         case "/health": body = "ok"
+        case "/capabilities": body = Probe.toJSON()
         case "/a11y/screenshot":
             // The daemon process itself holds the Screen Recording grant, so a
             // capture from HERE is reliable (a spawned CLI child is not).
@@ -117,7 +118,12 @@ final class HTTPConn {
             respond(status: 404, ctype: "text/plain", body: "not found")
             return
         }
-        let ctype = path == "/app.js" ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8"
+        let ctype: String
+        switch path {
+        case "/app.js": ctype = "application/javascript; charset=utf-8"
+        case "/capabilities": ctype = "application/json"
+        default: ctype = "text/html; charset=utf-8"
+        }
         respond(status: 200, ctype: ctype, body: body)
     }
 

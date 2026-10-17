@@ -47,8 +47,52 @@ final class AudioPipeline: NSObject {
     private override init() {}
 
     /// params reports the audio parameters advertised in Hello.
+    ///
+    /// hasAudio is false when no BlackHole device is present, because then the
+    /// capture path cannot work at all (see the class comment) and Hello must
+    /// not promise 0x05 frames.
     static func params() -> (Bool, UInt32, UInt8, UInt8) {
-        (true, rate, UInt8(channels), frameMs)
+        (probeBlackHole(), rate, UInt8(channels), frameMs)
+    }
+
+    // MARK: - /capabilities support
+
+    private static let probeLock = NSLock()
+    private static var probedBlackHole: Bool?
+
+    /// audioPath reports which capture backend produced PCM, for
+    /// /capabilities. It mirrors the Linux daemon's AudioPath: the answer is
+    /// only known once the (cheap) device check has run, so before that it says
+    /// "Probing".
+    static func audioPath() -> String {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        guard let ok = probedBlackHole else { return "Probing" }
+        return ok ? "BlackHole" : "None"
+    }
+
+    /// ensureProbed runs the device check once at startup so /capabilities can
+    /// resolve without waiting for a viewer to enable audio.
+    static func ensureProbed() {
+        _ = probeBlackHole()
+    }
+
+    /// probeBlackHole reports whether a BlackHole loopback device is installed.
+    /// It is cheap — it only enumerates devices — and does NOT open the
+    /// aggregate; that happens lazily in start().
+    @discardableResult
+    static func probeBlackHole() -> Bool {
+        probeLock.lock()
+        if let ok = probedBlackHole {
+            probeLock.unlock()
+            return ok
+        }
+        probeLock.unlock()
+        let ok = allDevices().contains { deviceName($0).contains("BlackHole") }
+        probeLock.lock()
+        probedBlackHole = ok
+        probeLock.unlock()
+        return ok
     }
 
     /// subscribe registers `sink` (one per process; the packets fan out to all
