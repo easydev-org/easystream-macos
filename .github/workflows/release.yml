@@ -1,0 +1,100 @@
+name: release
+
+# Build the macOS daemon for Intel and Apple Silicon and attach both to the
+# GitHub Release for the pushed tag.
+#
+# macOS cannot be cross-compiled from Linux: this is a Swift package that links
+# AppKit / VideoToolbox / CoreAudio, so it needs a macOS runner with Xcode. That
+# is also why the release assets used to be produced by hand inside a macOS
+# sandbox guest — the one build path in this project that could not run in the
+# Linux container. A macOS runner removes that asymmetry.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build assets for"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Swift has no include_str!, so the shared web UI is inlined as string
+  # literals into a GENERATED Swift file (see build-webui.sh). Without this step
+  # the build fails on the missing Assets.swift, so it is not optional.
+  WEBUI_REF: main
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, triple: arm64-apple-macosx14.0 }
+          - { arch: amd64, triple: x86_64-apple-macosx14.0 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: fetch the shared web UI
+        run: ./build-webui.sh
+
+      - name: build
+        run: |
+          set -euo pipefail
+          swift build -c release --arch ${{ matrix.arch }}
+          # SwiftPM writes into .build/<triple>/release for a cross-arch build,
+          # and .build/release for the host arch; take whichever exists.
+          bin="$(find .build -type f -name easystream -perm -u+x \
+                   -path '*release*' | head -1)"
+          [ -n "$bin" ] || { echo "::error::no easystream binary produced"; exit 1; }
+          out="easystream-macos-${{ matrix.arch }}"
+          cp "$bin" "/tmp/$out"
+          chmod +x "/tmp/$out"
+          file "/tmp/$out"
+          ls -l "/tmp/$out"
+          echo "ARTIFACT=$out" >> "$GITHUB_ENV"
+
+      # A Mach-O must say which architecture it is; publishing an arm64 binary
+      # under an amd64 name would only surface as "Bad CPU type" in the guest.
+      - name: verify architecture
+        run: |
+          set -euo pipefail
+          info="$(file -b "/tmp/$ARTIFACT")"
+          echo "$info"
+          case "${{ matrix.arch }}" in
+            arm64) echo "$info" | grep -q arm64 || { echo "::error::not arm64"; exit 1; } ;;
+            amd64) echo "$info" | grep -Eq 'x86_64|i386' || { echo "::error::not x86_64"; exit 1; } ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}
+          path: /tmp/easystream-macos-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/assets
+          merge-multiple: true
+      - run: ls -l /tmp/assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: /tmp/assets/easystream-macos-*
+          fail_on_unmatched_files: true
+          generate_release_notes: false
