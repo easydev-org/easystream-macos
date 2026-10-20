@@ -56,11 +56,15 @@ jobs:
       - name: fetch the shared web UI
         run: ./build-webui.sh
 
-      # This step did not exist before: the macOS workflow built a binary and
-      # published it with no test run at all. The tests are Swift unit tests, so
-      # on a native runner they simply run.
-      - name: test
-        run: swift test
+# NOTE: no test step. This package has no test target — `swift test` exits 1 with
+#   error: no tests found; create a target in the 'Tests' directory
+# which is not a failing test, it is the absence of any. Adding a step that
+# cannot pass is worse than not having one.
+#
+# The verification this workflow DOES perform is on the artifact itself: the
+# build must produce a binary, and `file` must report the architecture its name
+# claims, so an arm64 build can never be published as amd64 and fail later as
+# "Bad CPU type".
 
       - name: build
         run: |
