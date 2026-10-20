@@ -10,16 +10,24 @@ import Foundation
 /// software renderer makes replayd's DisplayStream fail ("Start stream failed",
 /// CoreGraphics error 1003), so the audio side never starts either.
 ///
-/// Instead we use the standard macOS "virtual audio device" technique:
+/// Instead the guest is wired with the standard macOS "virtual audio device"
+/// technique — but note WHO does each part:
 ///
-///   1. A BlackHole 2ch loopback device must be installed (HAL plug-in).
-///   2. BlackHole alone has no clock source and stays silent, so we wrap it in
-///      an AGGREGATE DEVICE together with the machine's real output (the QEMU
-///      USB sound card), which provides the clock. The aggregate is set as the
-///      default output, so every app's sound is routed into BlackHole.
-///   3. An AUHAL (kAudioUnitSubType_HALOutput) unit opened in duplex on that
-///      aggregate captures the looped-back PCM, which we convert to 20 ms Opus
-///      packets with AudioConverter.
+///   guest (oem.sh, once at boot)          this daemon (consume only)
+///   -----------------------------         ------------------------
+///   1. install the BlackHole 2ch          3. open the DEFAULT OUTPUT and read
+///      loopback HAL plug-in                  its capture side with an AUHAL
+///   2. run `aggregate`, which wraps          (kAudioUnitSubType_HALOutput) unit
+///      BlackHole in an aggregate              in duplex, then encode the
+///      clocked by the real output and         looped-back PCM to 20 ms Opus
+///      makes it the default output            packets with AudioConverter
+///
+/// The split matters: BlackHole alone has no clock and stays silent, so it must
+/// be aggregated with a real output — but doing that HERE made the system's
+/// default output a side effect of a daemon restart (destroy + recreate under
+/// every running app) and forced the clock source to be guessed from device
+/// names. The daemon therefore builds nothing: it reads the default output,
+/// whatever that happens to be.
 ///
 /// One pipeline serves the whole process (like VideoPipeline); every est
 /// connection that turns audio on subscribes to the same encoded packets.
@@ -34,7 +42,6 @@ final class AudioPipeline: NSObject {
     private var sink: ((Data) -> Void)?
     private var started = false
     private var unit: AudioUnit?
-    private var aggregate = AudioObjectID(kAudioObjectUnknown)
     private var converter: AudioConverterRef?
     private var asbd = AudioStreamBasicDescription()
     /// Scratch buffer handed to AudioUnitRender in the input callback.
@@ -64,6 +71,10 @@ final class AudioPipeline: NSObject {
     /// /capabilities. It mirrors the Linux daemon's AudioPath: the answer is
     /// only known once the (cheap) device check has run, so before that it says
     /// "Probing".
+    ///
+    /// The value names the MECHANISM (a BlackHole loopback), not the device we
+    /// happen to open: the daemon reads whatever the system's default output is,
+    /// which oem.sh has pointed at the aggregate containing BlackHole.
     static func audioPath() -> String {
         probeLock.lock()
         defer { probeLock.unlock() }
@@ -77,9 +88,18 @@ final class AudioPipeline: NSObject {
         _ = probeBlackHole()
     }
 
-    /// probeBlackHole reports whether a BlackHole loopback device is installed.
-    /// It is cheap — it only enumerates devices — and does NOT open the
-    /// aggregate; that happens lazily in start().
+    /// probeBlackHole reports whether system-audio capture is POSSIBLE.
+    ///
+    /// Two things must hold, and the second is the one that actually matters now
+    /// that oem.sh does the wiring:
+    ///
+    ///   1. a BlackHole loopback device is installed (the mechanism), and
+    ///   2. the default output device exposes a capture side — because that is
+    ///      literally the device start() opens. If oem.sh has not pointed the
+    ///      default output at the aggregate, opening it would yield nothing, and
+    ///      reporting "BlackHole" would be a lie.
+    ///
+    /// Cheap: it only enumerates devices and reads one property.
     @discardableResult
     static func probeBlackHole() -> Bool {
         probeLock.lock()
@@ -88,7 +108,10 @@ final class AudioPipeline: NSObject {
             return ok
         }
         probeLock.unlock()
-        let ok = allDevices().contains { deviceName($0).contains("BlackHole") }
+        let hasLoopback = allDevices().contains { deviceName($0).contains("BlackHole") }
+        let def = defaultOutputDevice()
+        let readable = def != AudioObjectID(kAudioObjectUnknown) && hasInputChannels(def)
+        let ok = hasLoopback && readable
         probeLock.lock()
         probedBlackHole = ok
         probeLock.unlock()
@@ -111,6 +134,51 @@ final class AudioPipeline: NSObject {
     }
 
     // MARK: - Device helpers
+
+    /// defaultOutputDevice returns the system's current default output device,
+    /// which is what the guest's audio is actually routed to.
+    ///
+    /// On a sandbox that is the "easystream Audio" aggregate that oem.sh builds
+    /// (BlackHole clocked by the real output), and reading its input side yields
+    /// the looped-back system audio. On a plain Mac it is the speakers, which have
+    /// no capture side — the caller checks that and falls back.
+    private static func defaultOutputDevice() -> AudioObjectID {
+        var dev = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var a = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &dev) != noErr {
+            return AudioObjectID(kAudioObjectUnknown)
+        }
+        return dev
+    }
+
+    /// hasInputChannels reports whether a device exposes any input channels —
+    /// i.e. whether there is a capture side to read the loopback from.
+    private static func hasInputChannels(_ dev: AudioObjectID) -> Bool {
+        var size: UInt32 = 0
+        var a = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectGetPropertyDataSize(dev, &a, 0, nil, &size) != noErr || size == 0 {
+            return false
+        }
+        let bl = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { bl.deallocate() }
+        let abl = bl.bindMemory(to: AudioBufferList.self, capacity: 1)
+        if AudioObjectGetPropertyData(dev, &a, 0, nil, &size, abl) != noErr {
+            return false
+        }
+        var ch: UInt32 = 0
+        let bufs = UnsafeMutableAudioBufferListPointer(abl)
+        for b in bufs { ch += b.mNumberChannels }
+        return ch > 0
+    }
 
     private static func allDevices() -> [AudioObjectID] {
         var a = AudioObjectPropertyAddress(
@@ -135,78 +203,42 @@ final class AudioPipeline: NSObject {
         return name as String
     }
 
-    private static func deviceUID(_ id: AudioObjectID) -> String {
-        var uid: CFString = "" as CFString
-        var a = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceUID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout<CFString>.size)
-        AudioObjectGetPropertyData(id, &a, 0, nil, &size, &uid)
-        return uid as String
-    }
-
-    private static func setDefault(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) {
-        var a = AudioObjectPropertyAddress(
-            mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        var dev = id
-        AudioObjectSetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &a, 0, nil,
-            UInt32(MemoryLayout<AudioObjectID>.size), &dev)
-    }
-
     // MARK: - Start
 
     private func start() {
-        let devices = Self.allDevices()
-        guard let blackhole = devices.first(where: { Self.deviceName($0).contains("BlackHole") }) else {
-            log("no BlackHole device; system audio capture unavailable")
+        // CONSUME ONLY. This daemon does not create, destroy or reconfigure any
+        // audio device: wiring the guest is oem.sh's job, done once at boot by
+        // the `aggregate` helper (BlackHole clocked by the real output, made the
+        // default output). We just open whatever the system's default output is
+        // and read its capture side.
+        //
+        // That boundary is deliberate. When the daemon built the aggregate
+        // itself, the system's default output became a side effect of a daemon
+        // restart — it destroyed and re-created the device underneath every
+        // running app and briefly left no default output at all. It also had to
+        // guess the clock source from device NAME strings. Both are gone: we now
+        // need to know nothing about clocks, aggregates or names.
+        let captureDevice = Self.defaultOutputDevice()
+        guard captureDevice != AudioObjectID(kAudioObjectUnknown) else {
+            log("no default output device; audio capture unavailable")
             return
         }
-        // The real output device (QEMU USB sound card) provides the clock.
-        guard let clock = devices.first(where: {
-            let n = Self.deviceName($0)
-            return n.contains("Audio Output") || n.contains("QEMU")
-        }) else {
-            log("no clock device for the aggregate")
+        guard Self.hasInputChannels(captureDevice) else {
+            // Normal on a real Mac: the default output is the speakers, and
+            // macOS exposes no system-audio loopback. In a sandbox this means the
+            // guest was not wired (oem.sh / aggregate did not run) — say so
+            // rather than silently producing silence.
+            Self.deviceName(captureDevice).withCString {
+                log("default output \"\(String(cString: $0))\" has no capture side; guest audio is not wired")
+            }
             return
         }
-        _ = AudioDeviceStart(clock, nil)
-
-        // Remove a stale aggregate left by an earlier run (the UID is fixed, so
-        // re-creating it without cleanup fails with kAudioHardwareBadObjectError).
-        for d in devices where Self.deviceName(d).contains("easystream Audio") {
-            AudioHardwareDestroyAggregateDevice(d)
+        Self.deviceName(captureDevice).withCString {
+            log("capturing system audio from \"\(String(cString: $0))\"")
         }
+        let aggID = captureDevice
 
-        // Wrap BlackHole in an aggregate device clocked by the real output.
-        let aggregateUID = "easystream-audio-aggregate"
-        let desc: [String: Any] = [
-            kAudioAggregateDeviceNameKey as String: "easystream Audio",
-            kAudioAggregateDeviceUIDKey as String: aggregateUID,
-            kAudioAggregateDeviceIsPrivateKey as String: false,
-            kAudioAggregateDeviceIsStackedKey as String: false,
-            kAudioAggregateDeviceClockDeviceKey as String: Self.deviceUID(clock),
-            kAudioAggregateDeviceSubDeviceListKey as String: [
-                [kAudioSubDeviceUIDKey as String: Self.deviceUID(blackhole)]
-            ],
-        ]
-        var aggID = AudioObjectID(kAudioObjectUnknown)
-        let crc = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
-        guard crc == noErr, aggID != kAudioObjectUnknown else {
-            log("AudioHardwareCreateAggregateDevice failed (\(crc))")
-            return
-        }
-        aggregate = aggID
-
-        // Route all system audio into the aggregate (=> into BlackHole).
-        Self.setDefault(aggID, kAudioHardwarePropertyDefaultOutputDevice)
-        Self.setDefault(aggID, kAudioHardwarePropertyDefaultSystemOutputDevice)
-        _ = AudioDeviceStart(aggID, nil)
-
-        // Open an AUHAL unit in duplex mode on the aggregate.
+        // Open an AUHAL unit in duplex mode on the capture device.
         var comp = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
