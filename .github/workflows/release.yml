@@ -29,7 +29,11 @@ env:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15, not macos-14: the package declares swift-tools-version 6.0 and
+    # macos-14 ships Swift 5.10, which refuses to load it:
+    #   error: package 'easystream-macos' is using Swift tools version 6.0.0 but
+    #   the installed version is 5.10.0
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -85,7 +89,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/download-artifact@v4
         with:
