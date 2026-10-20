@@ -33,13 +33,17 @@ jobs:
     # macos-14 ships Swift 5.10, which refuses to load it:
     #   error: package 'easystream-macos' is using Swift tools version 6.0.0 but
     #   the installed version is 5.10.0
-    runs-on: macos-15
+    #
+    # One NATIVE runner per architecture rather than `swift build --arch` on a
+    # single one: a cross-arch build can only be compiled, not tested, and the
+    # point of this job is that the tests actually run.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { arch: arm64, triple: arm64-apple-macosx14.0 }
-          - { arch: amd64, triple: x86_64-apple-macosx14.0 }
+          - { runner: macos-15,       arch: arm64 }
+          - { runner: macos-15-intel, arch: amd64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -52,15 +56,18 @@ jobs:
       - name: fetch the shared web UI
         run: ./build-webui.sh
 
+      # This step did not exist before: the macOS workflow built a binary and
+      # published it with no test run at all. The tests are Swift unit tests, so
+      # on a native runner they simply run.
+      - name: test
+        run: swift test
+
       - name: build
         run: |
           set -euo pipefail
-          swift build -c release --arch ${{ matrix.arch }}
-          # SwiftPM writes into .build/<triple>/release for a cross-arch build,
-          # and .build/release for the host arch; take whichever exists.
-          bin="$(find .build -type f -name easystream -perm -u+x \
-                   -path '*release*' | head -1)"
-          [ -n "$bin" ] || { echo "::error::no easystream binary produced"; exit 1; }
+          swift build -c release
+          bin=".build/release/easystream"
+          [ -x "$bin" ] || { echo "::error::no easystream binary produced"; exit 1; }
           out="easystream-macos-${{ matrix.arch }}"
           cp "$bin" "/tmp/$out"
           chmod +x "/tmp/$out"
