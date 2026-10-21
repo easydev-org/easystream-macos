@@ -1,0 +1,46 @@
+name: ci
+
+# Check every push and pull request: build the Swift package.
+#
+# release.yml is tag-only, so a push to main ran nothing at all.
+#
+# macos-15 because the package declares swift-tools-version 6.0 and macos-14
+# ships Swift 5.10, which refuses to load it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      # Swift has no include_str!, so the shared UI is inlined as string literals
+      # into a GENERATED Swift file. Without this the build fails on the missing
+      # Assets.swift, so it is not optional.
+      - name: fetch the shared web UI
+        run: ./build-webui.sh
+
+      - name: build
+        run: swift build -c release
+
+      # The binary must be produced and be a Mach-O of this machine's arch: a
+      # build that "succeeds" without an executable is the failure mode worth
+      # catching here.
+      - name: assert the binary exists
+        run: |
+          set -euo pipefail
+          test -x .build/release/easystream
+          file .build/release/easystream
