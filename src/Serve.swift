@@ -64,11 +64,7 @@ enum Serve {
     /// connected after a ConfigSet would otherwise keep decoding at the old size.
     static func broadcastHello() {
         let (cw, ch) = VideoConfig.shared.capture
-        let payload = helloPayload(capW: UInt32(cw), capH: UInt32(ch))
-        Conn.lock.lock()
-        let conns = Array(Conn.live.values)
-        Conn.lock.unlock()
-        for c in conns { c.writeFrame(tHello, payload) }
+        Conn.broadcastHello(payload: helloPayload(capW: UInt32(cw), capH: UInt32(ch)))
     }
 
     /// Parse a 0x08 ConfigSet body into a Patch.
@@ -150,6 +146,15 @@ enum Serve {
         // Keep every live connection referenced: NWListener's newConnectionHandler
         // returns immediately, so without this the Conn would deallocate and the
         // video thread (weak self) would never run.
+        /// Send a frame to every live connection. Lives here because `lock` and
+        /// `live` are private to Conn.
+        static func broadcastHello(payload: Data) {
+            lock.lock()
+            let conns = Array(live.values)
+            lock.unlock()
+            for c in conns { c.writeFrame(tHello, payload) }
+        }
+
         private static let lock = NSLock()
         private static var live: [ObjectIdentifier: Conn] = [:]
 
@@ -174,7 +179,8 @@ enum Serve {
             // One shared video pipeline for the whole daemon (started once).
             Conn.startVideoOnce()
             // Audio: subscribe this connection to the shared Opus pipeline.
-            if hasAudio {
+            let (hasAudioNow, _, _, _) = AudioPipeline.params()
+            if hasAudioNow {
                 AudioPipeline.shared.subscribe { [weak self] pkt in
                     guard let self = self else { return }
                     if self.audioOn { self.writeFrame(Serve.tAudio, pkt) }

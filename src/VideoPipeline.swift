@@ -62,7 +62,7 @@ final class VideoPipeline {
             let h = oh != 0 ? oh : capH
             let e = VTEncoder(width: w, height: h, fps: VideoConfig.shared.frameRate,
                               bitrate: VideoConfig.shared.bitRate)
-            if e != nil { VideoConfig.shared.setActiveEncoder(VideoConfig.encVideoToolbox) }
+            if e != nil { VideoConfig.shared.setActiveEncoder(UInt8(VideoConfig.encVideoToolbox)) }
             FileHandle.standardError.write("est pump: encoder opened w=" + String(w) + " h=" + String(h) + " gen=" + String(VideoConfig.shared.generationNow) + "\n")
             return e
         }
