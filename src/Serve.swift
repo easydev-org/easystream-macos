@@ -244,14 +244,12 @@ enum Serve {
             }
             if typ == Serve.tConfigSet {
                 if let err = Serve.applyConfig(a) {
-                    FileHandle.standardError.write("est: ConfigSet rejected: \(err)
-".data(using: .utf8)!)
+                    FileHandle.standardError.write("est: ConfigSet rejected: \(err)\n".data(using: .utf8)!)
                     writeFrame(Serve.tConfigAck, Serve.ackBody(ok: false, msg: err))
                 } else {
                     let (ow, oh) = VideoConfig.shared.output
                     FileHandle.standardError.write(
-                        "est: ConfigSet ok -> \(ow)x\(oh) fps=\(VideoConfig.shared.frameRate) br=\(VideoConfig.shared.bitRate) gen=\(VideoConfig.shared.generationNow)
-".data(using: .utf8)!)
+                        "est: ConfigSet ok -> \(ow)x\(oh) fps=\(VideoConfig.shared.frameRate) br=\(VideoConfig.shared.bitRate) gen=\(VideoConfig.shared.generationNow)\n".data(using: .utf8)!)
                     writeFrame(Serve.tConfigAck, Serve.ackBody(ok: true, msg: ""))
                     // Tell EVERY viewer, not just the one that asked.
                     Serve.broadcastHello()

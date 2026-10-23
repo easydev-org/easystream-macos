@@ -110,8 +110,7 @@ final class VideoPipeline {
                     enc.forceKeyframe()
                     lastKey = Date()
                 } else {
-                    FileHandle.standardError.write("est pump: encoder reopen failed
-".data(using: .utf8)!)
+                    FileHandle.standardError.write("est pump: encoder reopen failed\n".data(using: .utf8)!)
                 }
             }
             // Do NOT pre-sleep before capturing: the pump used to wait out the
