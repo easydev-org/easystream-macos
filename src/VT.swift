@@ -98,6 +98,45 @@ final class VTEncoder {
         return encodePixelBuffer(pb)
     }
 
+    /// encodeSized encodes a frame whose CAPTURE geometry may differ from the
+    /// encoder's, scaling on the way in.
+    ///
+    /// Scaling happens here because the screen source hands back the display
+    /// size and cannot be asked for another one: AVCaptureScreenInput and
+    /// CGWindowList both own their geometry. Bilinear via CGContext rather than
+    /// nearest-neighbour, because the presets halve the resolution and a naive
+    /// pick makes text shimmer.
+    func encodeSized(_ bgra: [UInt8], srcW: Int, srcH: Int) -> [Data] {
+        if srcW == width && srcH == height { return encode(bgra) }
+        guard session != nil else { return [] }
+        out.removeAll(keepingCapacity: true)
+        guard let scaled = Self.scaleBGRA(bgra, srcW: srcW, srcH: srcH, dstW: width, dstH: height),
+              let pb = makePixelBuffer(from: scaled) else { return [] }
+        return encodePixelBuffer(pb)
+    }
+
+    /// scaleBGRA resizes a top-down BGRA buffer with CGContext's interpolation.
+    static func scaleBGRA(_ src: [UInt8], srcW: Int, srcH: Int, dstW: Int, dstH: Int) -> [UInt8]? {
+        var dst = [UInt8](repeating: 0, count: dstW * dstH * 4)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let info = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        let ok = src.withUnsafeBufferPointer { sp -> Bool in
+            guard let srcCtx = CGContext(data: UnsafeMutableRawPointer(mutating: sp.baseAddress),
+                                         width: srcW, height: srcH, bitsPerComponent: 8,
+                                         bytesPerRow: srcW * 4, space: cs, bitmapInfo: info),
+                  let srcImg = srcCtx.makeImage() else { return false }
+            return dst.withUnsafeMutableBufferPointer { dp -> Bool in
+                guard let dstCtx = CGContext(data: dp.baseAddress, width: dstW, height: dstH,
+                                             bitsPerComponent: 8, bytesPerRow: dstW * 4,
+                                             space: cs, bitmapInfo: info) else { return false }
+                dstCtx.interpolationQuality = .medium
+                dstCtx.draw(srcImg, in: CGRect(x: 0, y: 0, width: dstW, height: dstH))
+                return true
+            }
+        }
+        return ok ? dst : nil
+    }
+
     /// encodePixelBuffer encodes a CVPixelBuffer directly (used by the live
     /// SCStream path, which already hands us BGRA CVPixelBuffers — no copy).
     func encodePixelBuffer(_ pb: CVPixelBuffer) -> [Data] {

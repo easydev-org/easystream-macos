@@ -46,7 +46,11 @@ enum Auth {
         switch typ {
         case 0x10, 0x11, 0x12, 0x13, 0x14,  // pointer + keyboard
              0x26,                          // a11y ActionReq
-             0x32:                          // ClipSet
+             0x32,                          // ClipSet
+             // ConfigSet changes what EVERY viewer receives, so it belongs to the
+             // control plane: a read-only viewer must not be able to force a
+             // quality on everybody watching.
+             0x08:
             return true
         default:
             return false

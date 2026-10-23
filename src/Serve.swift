@@ -10,6 +10,9 @@ import Network
 enum Serve {
     // Message types (EST.md).
     private static let tHello: UInt8 = 0x01
+    /// Run-time reconfiguration (EST.md 0x08/0x09).
+    static let tConfigSet: UInt8 = 0x08
+    static let tConfigAck: UInt8 = 0x09
     private static let tVideo: UInt8 = 0x02
     private static let tAuth: UInt8 = 0x03
     private static let tAuthOk: UInt8 = 0x04
@@ -26,6 +29,108 @@ enum Serve {
     private static let tClipSet: UInt8 = 0x32
     private static let tPing: UInt8 = 0x50
     private static let tPong: UInt8 = 0x51
+
+    /// Build a Hello for the CURRENT video configuration (EST.md).
+    ///
+    /// 23 bytes: the v1 core (7), the audio block (8) and the video block at
+    /// offset 15 (8). The video block is APPENDED, so a client that stops at the
+    /// audio block parses this exactly as before.
+    static func helloPayload(capW: UInt32, capH: UInt32) -> Data {
+        let cfg = VideoConfig.shared
+        var hello = [UInt8](repeating: 0, count: 7 + 8 + 8)
+        hello[0] = 1; hello[1] = 1
+        // Report what the encoder EMITS, not the capture size: once someone picks
+        // a preset the two differ, and a decoder configured for the capture size
+        // rejects every frame.
+        let (ow, oh) = cfg.output
+        let w = ow != 0 ? ow : Int(capW)
+        let h = oh != 0 ? oh : Int(capH)
+        hello[2] = UInt8((w >> 8) & 0xff); hello[3] = UInt8(w & 0xff)
+        hello[4] = UInt8((h >> 8) & 0xff); hello[5] = UInt8(h & 0xff)
+        hello[6] = UInt8(cfg.frameRate)
+        let (hasAudio, aRate, aCh, aMs) = AudioPipeline.params()
+        hello[7] = hasAudio ? 1 : 0
+        hello[8] = 1
+        hello[9] = UInt8((aRate >> 24) & 0xff); hello[10] = UInt8((aRate >> 16) & 0xff)
+        hello[11] = UInt8((aRate >> 8) & 0xff); hello[12] = UInt8(aRate & 0xff)
+        hello[13] = aCh; hello[14] = aMs
+        let vb = cfg.helloBlock()
+        for i in 0..<8 { hello[15 + i] = vb[i] }
+        return Data(hello)
+    }
+
+    /// Re-announce the video configuration to every live connection. Hello is the
+    /// only authoritative statement of geometry (EST.md), so viewers that stayed
+    /// connected after a ConfigSet would otherwise keep decoding at the old size.
+    static func broadcastHello() {
+        let (cw, ch) = VideoConfig.shared.capture
+        let payload = helloPayload(capW: UInt32(cw), capH: UInt32(ch))
+        Conn.lock.lock()
+        let conns = Array(Conn.live.values)
+        Conn.lock.unlock()
+        for c in conns { c.writeFrame(tHello, payload) }
+    }
+
+    /// Parse a 0x08 ConfigSet body into a Patch.
+    ///
+    /// The cursor walks the frame strictly: every field knows its own length, and
+    /// a frame that ends early is an error, not a partial patch. Truncation is
+    /// the likeliest corruption here, and applying half of it would move the
+    /// stream somewhere nobody asked for.
+    static func parseConfig(_ b: [UInt8]) -> (VideoConfig.Patch?, String?) {
+        var p = VideoConfig.Patch()
+        var i = 0
+        func need(_ n: Int) -> Bool { i + n <= b.count }
+        guard need(1) else { return (nil, "truncated: hasWidth") }
+        if b[i] != 0 {
+            guard need(3) else { return (nil, "truncated: width") }
+            p.width = UInt32(b[i + 1]) << 8 | UInt32(b[i + 2])
+        }
+        i += 3
+        guard need(1) else { return (nil, "truncated: hasHeight") }
+        if b[i] != 0 {
+            guard need(3) else { return (nil, "truncated: height") }
+            p.height = UInt32(b[i + 1]) << 8 | UInt32(b[i + 2])
+        }
+        i += 3
+        guard need(1) else { return (nil, "truncated: hasFps") }
+        if b[i] != 0 {
+            guard need(2) else { return (nil, "truncated: fps") }
+            p.fps = b[i + 1]
+        }
+        i += 2
+        guard need(1) else { return (nil, "truncated: hasBitrate") }
+        if b[i] != 0 {
+            guard need(5) else { return (nil, "truncated: bitrate") }
+            p.bitrate = UInt32(b[i + 1]) << 24 | UInt32(b[i + 2]) << 16
+                      | UInt32(b[i + 3]) << 8 | UInt32(b[i + 4])
+        }
+        i += 5
+        guard need(1) else { return (nil, "truncated: hasEncoder") }
+        if b[i] != 0 {
+            guard need(2) else { return (nil, "truncated: encoder") }
+            let e = b[i + 1]
+            // 0xFF is the documented "let the server pick" value.
+            p.encoder = (e == 0xFF) ? 0 : e
+        }
+        return (p, nil)
+    }
+
+    /// Build a 0x09 ConfigAck body: ok byte, then a length-prefixed UTF-8 reason.
+    static func ackBody(ok: Bool, msg: String) -> Data {
+        let m = Array(msg.utf8.prefix(255))
+        var d = Data([ok ? 1 : 0, UInt8(m.count)])
+        d.append(contentsOf: m)
+        return d
+    }
+
+    /// applyConfig validates and applies a ConfigSet, returning a refusal reason.
+    static func applyConfig(_ b: [UInt8]) -> String? {
+        let (p, err) = parseConfig(b)
+        if let e = err { return e }
+        guard let patch = p else { return "empty" }
+        return VideoConfig.shared.apply(patch)
+    }
 
     static func run(port: UInt16) throws {
         let params = NWParameters.tcp
@@ -64,21 +169,8 @@ enum Serve {
             FileHandle.standardError.write("est: conn start\n".data(using: .utf8)!)
             Conn.lock.lock(); Conn.live[ObjectIdentifier(self)] = self; Conn.lock.unlock()
             conn.start(queue: .global())
-            // Hello: version, codec(H.264), w, h, fps.
             let (w, h) = screenSize()
-            var hello = [UInt8](repeating: 0, count: 7 + 8)
-            hello[0] = 1; hello[1] = 1
-            hello[2] = UInt8(w >> 8); hello[3] = UInt8(w & 0xff)
-            hello[4] = UInt8(h >> 8); hello[5] = UInt8(h & 0xff)
-            hello[6] = 30
-            // Audio block @7: present, codec(1=Opus), rate(u32), ch, frameMs.
-            let (hasAudio, aRate, aCh, aMs) = AudioPipeline.params()
-            hello[7] = hasAudio ? 1 : 0
-            hello[8] = 1
-            hello[9] = UInt8((aRate >> 24) & 0xff); hello[10] = UInt8((aRate >> 16) & 0xff)
-            hello[11] = UInt8((aRate >> 8) & 0xff); hello[12] = UInt8(aRate & 0xff)
-            hello[13] = aCh; hello[14] = aMs
-            writeFrame(tHello, Data(hello))
+            writeFrame(tHello, Serve.helloPayload(capW: UInt32(w), capH: UInt32(h)))
             // One shared video pipeline for the whole daemon (started once).
             Conn.startVideoOnce()
             // Audio: subscribe this connection to the shared Opus pipeline.
@@ -148,6 +240,25 @@ enum Serve {
                 mode = Auth.authorize(tok)
                 writeFrame(Serve.tAuthOk, Data([mode.rawValue]))
                 FileHandle.standardError.write("est: auth -> \(mode)\n".data(using: .utf8)!)
+                return
+            }
+            if typ == Serve.tConfigSet {
+                if let err = Serve.applyConfig(a) {
+                    FileHandle.standardError.write("est: ConfigSet rejected: \(err)
+".data(using: .utf8)!)
+                    writeFrame(Serve.tConfigAck, Serve.ackBody(ok: false, msg: err))
+                } else {
+                    let (ow, oh) = VideoConfig.shared.output
+                    FileHandle.standardError.write(
+                        "est: ConfigSet ok -> \(ow)x\(oh) fps=\(VideoConfig.shared.frameRate) br=\(VideoConfig.shared.bitRate) gen=\(VideoConfig.shared.generationNow)
+".data(using: .utf8)!)
+                    writeFrame(Serve.tConfigAck, Serve.ackBody(ok: true, msg: ""))
+                    // Tell EVERY viewer, not just the one that asked.
+                    Serve.broadcastHello()
+                    // The encoder is rebuilt by the pump on its next tick; ask for
+                    // an IDR so the new geometry has a starting point.
+                    VideoPipeline.shared.requestKeyframe()
+                }
                 return
             }
             if typ == Serve.tAudioReq { audioOn = true; return }

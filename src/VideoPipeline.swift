@@ -51,7 +51,22 @@ final class VideoPipeline {
             return
         }
         FileHandle.standardError.write("est: ScreenInput started \(input.width)x\(input.height)\n".data(using: .utf8)!)
-        guard let enc = VTEncoder(width: input.width, height: input.height, fps: 30, bitrate: 25_000_000) else {
+        // Publish the capture size once; VideoConfig keeps capture and OUTPUT
+        // geometry apart because the screen source owns the former.
+        let capW = Int(input.width), capH = Int(input.height)
+        VideoConfig.shared.setCapture(capW, capH)
+        var encGen = VideoConfig.shared.generationNow
+        func openEncoder() -> VTEncoder? {
+            let (ow, oh) = VideoConfig.shared.output
+            let w = ow != 0 ? ow : capW
+            let h = oh != 0 ? oh : capH
+            let e = VTEncoder(width: w, height: h, fps: VideoConfig.shared.frameRate,
+                              bitrate: VideoConfig.shared.bitRate)
+            if e != nil { VideoConfig.shared.setActiveEncoder(VideoConfig.encVideoToolbox) }
+            FileHandle.standardError.write("est pump: encoder opened w=" + String(w) + " h=" + String(h) + " gen=" + String(VideoConfig.shared.generationNow) + "\n")
+            return e
+        }
+        guard var enc = openEncoder() else {
             FileHandle.standardError.write("est: VTEncoder init failed\n".data(using: .utf8)!)
             return
         }
@@ -78,6 +93,27 @@ final class VideoPipeline {
         var lastEmit = Date.distantPast
         while true {
             let start = Date()
+            // A ConfigSet landed: rebuild the encoder at the new geometry. Done
+            // here, in the pump, because VTEncoder is immutable and every
+            // reference to it lives on this thread.
+            let gen = VideoConfig.shared.generationNow
+            if gen != encGen {
+                // Drop the old session BEFORE creating the new one: two hardware
+                // encoders at once fail to open on a VM.
+                enc.close()
+                if let fresh = openEncoder() {
+                    enc = fresh
+                    encGen = gen
+                    // No reference frames in the new session, and every client
+                    // reset its decoder on the new Hello: the first frame must
+                    // be an IDR.
+                    enc.forceKeyframe()
+                    lastKey = Date()
+                } else {
+                    FileHandle.standardError.write("est pump: encoder reopen failed
+".data(using: .utf8)!)
+                }
+            }
             // Do NOT pre-sleep before capturing: the pump used to wait out the
             // frame interval BEFORE looking for a change AND sleep again at the
             // tail, so a change took up to ~2 intervals (~66ms) to reach the
@@ -108,7 +144,9 @@ final class VideoPipeline {
                 if since < minInterval { usleep(useconds_t((minInterval - since) * 1_000_000)) }
                 lastEmit = Date()
                 if let (_, _, bgra) = Self.grabBGRA() {
-                    let aus = enc.encode(bgra)
+                    // Pass the CAPTURE size: the encoder may be emitting a smaller
+                    // frame and scales in encodeSized.
+                    let aus = enc.encodeSized(bgra, srcW: capW, srcH: capH)
                     if !aus.isEmpty { sink(aus.reduce(into: Data()) { $0.append($1) }) }
                 }
             } else {
