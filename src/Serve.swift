@@ -173,7 +173,37 @@ enum Serve {
         func start() {
             FileHandle.standardError.write("est: conn start\n".data(using: .utf8)!)
             Conn.lock.lock(); Conn.live[ObjectIdentifier(self)] = self; Conn.lock.unlock()
+            // NOTHING may be sent before the connection is READY.
+            //
+            // NWConnection.send on a connection still in .preparing/.setup calls
+            // its completion with an error and DROPS the data - it does not
+            // queue it. Sending Hello immediately after start() therefore worked
+            // for the first viewer (the race happened to go our way) and failed
+            // for every later one while the encoder kept the CPU busy: the client
+            // connected, received no Hello at all, and the stream looked dead
+            // from the browser's point of view.
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.beginSession()
+                case .failed, .cancelled:
+                    Conn.lock.lock(); Conn.live[ObjectIdentifier(self)] = nil; Conn.lock.unlock()
+                default:
+                    break
+                }
+            }
             conn.start(queue: .global())
+        }
+
+        /// beginSession runs once the connection is READY. Everything that SENDS
+        /// lives here for the reason above; guard stops a second .ready (which
+        /// Network.framework can deliver after an interim state) from sending a
+        /// second Hello and a duplicate video subscription.
+        private var sessionStarted = false
+        private func beginSession() {
+            if sessionStarted { return }
+            sessionStarted = true
             let (w, h) = screenSize()
             writeFrame(tHello, Serve.helloPayload(capW: UInt32(w), capH: UInt32(h)))
             // One shared video pipeline for the whole daemon (started once).
