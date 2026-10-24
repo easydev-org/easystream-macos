@@ -13,6 +13,8 @@ enum Serve {
     /// Run-time reconfiguration (EST.md 0x08/0x09).
     static let tConfigSet: UInt8 = 0x08
     static let tConfigAck: UInt8 = 0x09
+    /// Ask for an IDR without changing anything (EST.md 0x0A).
+    static let tKeyFrameReq: UInt8 = 0x0A
     private static let tVideo: UInt8 = 0x02
     private static let tAuth: UInt8 = 0x03
     private static let tAuthOk: UInt8 = 0x04
@@ -276,6 +278,13 @@ enum Serve {
                 mode = Auth.authorize(tok)
                 writeFrame(Serve.tAuthOk, Data([mode.rawValue]))
                 FileHandle.standardError.write("est: auth -> \(mode)\n".data(using: .utf8)!)
+                return
+            }
+            if typ == Serve.tKeyFrameReq {
+                // Not a mutation: a read-only viewer may recover from a corrupt
+                // picture. The pipeline latches the request, so asking every
+                // frame still yields one IDR per frame interval.
+                VideoPipeline.shared.requestKeyframe()
                 return
             }
             if typ == Serve.tConfigSet {
